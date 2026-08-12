@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200112L
+#define _DEFAULT_SOURCE
 
 #include <stdio.h>
 #include <string.h>
@@ -7,16 +8,21 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <stdlib.h>
-int send_all (int client_fd, char* buffer, size_t bytes);
+#include <stdbool.h>
+#include <sys/stat.h>
+
+int send_all(int client_fd, char *buffer, size_t bytes);
+void error_handling(int client_fd, char *absolute_file_path, char *error_type, char *body);
+
 int main(void) {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET; // Allow IPv4
-    hints.ai_socktype = SOCK_STREAM; // TCP socket
-    hints.ai_flags = AI_PASSIVE; // For wildcard IP address
-    
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
     int result = getaddrinfo(NULL, "8080", &hints, &res);
     if (result != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(result));
@@ -44,6 +50,14 @@ int main(void) {
     }
     freeaddrinfo(res);
 
+    // Resolve the absolute path of the webroot once, at startup
+    char *absolute_path = realpath("./www", NULL);
+    if (absolute_path == NULL) {
+        perror("realpath");
+        close(socket_fd);
+        return 1;
+    }
+
     while (1) {
         int client_fd = accept(socket_fd, NULL, NULL);
         if (client_fd == -1) {
@@ -52,9 +66,7 @@ int main(void) {
             return 1;
         }
         char buffer[1024];
-        //recv doesnt need null terminator since it takes in length of bytes
         int bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        //buffer needs to be null terminated to be printed as a string
         if (bytes_received == -1) {
             perror("recv");
             close(client_fd);
@@ -69,9 +81,7 @@ int main(void) {
             continue;
         }
 
-        //Parsing part of HTTP server
-
-        // Parse the request line from the buffer.
+        // Parse the request line
         char parse[1024];
         int found_end = 0;
         for (int i = 0; i < bytes_received - 1; i++) {
@@ -87,8 +97,6 @@ int main(void) {
             }
         }
 
-
-
         if (!found_end) {
             printf("Invalid HTTP request: no CRLF found\n");
             close(client_fd);
@@ -97,23 +105,13 @@ int main(void) {
 
         printf("Parsed request line: %s\n", parse);
         char method[16], path[256], version[16];
-        if (sscanf(parse, "%15s %255s %15s", method, path, version) != 3) {
-            printf("Invalid HTTP request line: %s\n", parse);
-            close(client_fd);
-            continue;
-        }
-
-        //Now we need to parse method, path, and version seperately from parse
-        //We do this by finding first space, then memcpy from start to index (method)
-        //Then we find second space, and memcpy from index after first space to index of second space (path)
-        //Finally, we use the seond space and memcpy from index after second space to end of parse string (version)
 
         int first_space_index = -1;
         int parse_len = (int)strlen(parse);
 
         for (int i = 0; i < parse_len; i++) {
             if (parse[i] == ' ') {
-                size_t method_len = (size_t)(i); //returns index in size_t type
+                size_t method_len = (size_t)(i);
                 if (method_len >= sizeof(method)) {
                     method_len = sizeof(method) - 1;
                 }
@@ -139,12 +137,8 @@ int main(void) {
                 if (path_len >= sizeof(path)) {
                     path_len = sizeof(path) - 1;
                 }
-                //Path starts the index after the first space
-                //Ends at the index of the second space
                 memcpy(path, parse + first_space_index + 1, path_len);
                 size_t version_len = parse_len - second_space_index - 1;
-                    //for the version, we want to copy from index after second space
-                    //to end of parse string
                 if (version_len >= sizeof(version)) {
                     version_len = sizeof(version) - 1;
                 }
@@ -161,328 +155,275 @@ int main(void) {
             continue;
         }
 
-
         if (strlen(method) == 0 || strlen(path) == 0 || strlen(version) == 0) {
             printf("Invalid HTTP request line: %s\n", parse);
             close(client_fd);
             continue;
         }
 
-        //Validation parts of the request line
+        // Validation
 
         if (strcmp(method, "GET") != 0) {
-            const char *body = "<html><body><h1>405 Method Not Allowed</h1></body></html>";
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body),
-                body
-            );
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
-
-                int send_fd = send(client_fd, response, (size_t)response_len, 0);
-                if (send_fd == -1) {
-                    perror("send");
-                    close(client_fd);
-                    continue;
-                }
-            }
-            printf("405 Method Not Allowed: %s\n", method);
-            close(client_fd);
+            error_handling(client_fd, NULL, "405 Method Not Allowed", "<html><body><h1>405 Method Not Allowed</h1></body></html>");
             continue;
         }
 
         if (path[0] != '/') {
-            const char *body = "<html><body><h1>400 Bad Request</h1></body></html>";
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body),
-                body
-            );
-            printf("400 Bad Request: %s\n", path);
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
-
-                int send_fd = send(client_fd, response, (size_t)response_len, 0);
-                if (send_fd == -1) {
-                    perror("send");
-                    close(client_fd);
-                    continue;
-                }
-            }
-        
-            close(client_fd);
+            error_handling(client_fd, NULL, "400 Bad Request", "<html><body><h1>400 Bad Request</h1></body></html>");
             continue;
         }
 
         if (strcmp(version, "HTTP/1.1") != 0) {
-            const char *body = "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>";
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 505 HTTP Version Not Supported\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body),
-                body
-            );
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
-
-                int send_fd = send(client_fd, response, (size_t)response_len, 0);
-                if (send_fd == -1) {
-                    perror("send");
-                    close(client_fd);
-                    continue;
-                }
-            }
-            printf("505 HTTP Version Not Supported: %s\n", version);
-            close(client_fd);
+            error_handling(client_fd, NULL, "505 HTTP Version Not Supported", "<html><body><h1>505 HTTP Version Not Supported</h1></body></html>");
             continue;
         }
-
-
-
 
         printf("Parsed method: %s\n", method);
         printf("Parsed path: %s\n", path);
         printf("Parsed version: %s\n", version);
 
-        char file_path[256];
+        // Build candidate path: webroot + request path
+        char file_path[256] = "./www";
+        size_t current_len = strlen(file_path);
+        int rtn;
+        size_t remaining_length;
         if (strcmp(path, "/") == 0) {
-            strncpy(file_path, "./www/index.html", sizeof(file_path) - 1);
-            file_path[sizeof(file_path) - 1] = '\0';
-        } else if (strcmp(path, "/about.html") == 0) {
-            strncpy(file_path, "./www/about.html", sizeof(file_path) - 1);
-            file_path[sizeof(file_path) - 1] = '\0';
+            rtn = snprintf(file_path, sizeof(file_path), "./www/index.html");
+            remaining_length = sizeof(file_path);
         } else {
-            const char *body = "<html><body><h1>404 Not Found</h1></body></html>";
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 404 Not Found\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body),
-                body
-            );
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
+            rtn = snprintf(file_path + current_len, sizeof(file_path) - current_len, "%s", path);
+            remaining_length = sizeof(file_path) - current_len;
+        }
 
-                int send_fd = send(client_fd, response, (size_t)response_len, 0);
-                if (send_fd == -1) {
-                    perror("send");
-                }
-            }
-            printf("404 Not Found: %s\n", path);
+        if (rtn < 0) {
+            printf("Formatting error");
+            close(client_fd);
+            continue;
+        } else if ((size_t)rtn >= remaining_length) {
+            printf("Not enough room, output was truncated.");
             close(client_fd);
             continue;
         }
 
-        FILE *file = fopen(file_path, "r");
-        
-
-        if (file == NULL) {
-            const char *body = "<html><body><h1>404 Not Found</h1></body></html>";
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 404 Not Found\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "%s",
-                strlen(body),
-                body
-            );
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
-
-                int send_fd = send(client_fd, response, (size_t)response_len, 0);
-                if (send_fd == -1) {
-                    perror("send");
-                }
-            }
-            printf("404 Not Found: %s\n", file_path);
-            close(client_fd);
+        // Resolve the candidate path
+        char *absolute_file_path = realpath(file_path, NULL);
+        if (absolute_file_path == NULL) {
+            error_handling(client_fd, NULL, "404 Not Found", "<html><body><h1>404 Not Found</h1></body></html>");
             continue;
-        } else {
+        }
 
-            int fseek_result = fseek(file, 0, SEEK_END);
-            if (fseek_result != 0) {
-                perror("fseek");
-                fclose(file);
-                close(client_fd);
-                continue;
+        // Verify resolved path is inside the webroot
+        size_t absolute_path_len = strlen(absolute_path);
+        size_t absolute_file_path_len = strlen(absolute_file_path);
+
+        if (absolute_file_path_len < absolute_path_len) {
+            error_handling(client_fd, absolute_file_path, "403 Forbidden", "<html><body><h1>403 Forbidden</h1></body></html>");
+            continue;
+        }
+
+        bool is_valid_path = true;
+        for (size_t i = 0; i < absolute_path_len; i++) {
+            if (absolute_path[i] != absolute_file_path[i]) {
+                is_valid_path = false;
+                break;
             }
-            
-            long file_size = ftell(file);
+        }
 
-            if (file_size < 0) {
-                perror("ftell");
-                fclose(file);
-                close(client_fd);
-                continue;
-            }
+        if (!is_valid_path) {
+            error_handling(client_fd, absolute_file_path, "403 Forbidden", "<html><body><h1>403 Forbidden</h1></body></html>");
+            continue;
+        }
 
-            size_t file_size_t = (size_t)file_size;
+        if (absolute_file_path[absolute_path_len] != '/' && absolute_file_path[absolute_path_len] != '\0') {
+            error_handling(client_fd, absolute_file_path, "403 Forbidden", "<html><body><h1>403 Forbidden</h1></body></html>");
+            continue;
+        }
 
-            rewind(file);
-            char *file_buffer = malloc(file_size_t + 1);
-            if (file_buffer == NULL) {
-                perror("malloc");
-                fclose(file);
-                close(client_fd);
-                continue;
-            }
+        // Verify it's a regular file
+        struct stat file_stat;
+        int stat_result = stat(absolute_file_path, &file_stat);
 
-            size_t bytes_read = fread(file_buffer, 1, (size_t)file_size, file);
-            file_buffer[bytes_read] = '\0';
-            if (bytes_read != (size_t)file_size) {
-                if (bytes_read < (size_t)file_size) {
-                    fprintf(stderr, "fread: unexpected end of file\n");
-                } else {
-                    perror("fread");
-                }
-                free(file_buffer);
-                fclose(file);
-                close(client_fd);
-                continue;
-            }
+        if (stat_result < 0) {
+            error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+            continue;
+        }
 
-            char response[1024];
-            int response_len = snprintf(
-                response,
-                sizeof(response),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: %zu\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                bytes_read
-            );
+        if (!S_ISREG(file_stat.st_mode)) {
+            error_handling(client_fd, absolute_file_path, "404 Not Found", "<html><body><h1>404 Not Found</h1></body></html>");
+            continue;
+        }
 
-            if (response_len > 0 && response_len < (int)sizeof(response)) {
-            int send_fd = send_all(client_fd, response, (size_t)response_len);
-                if (send_fd == 0) {
-                    perror("send");
-                    free(file_buffer);
-                    fclose(file);
-                    close(client_fd);
-                    continue;
-                } else if (send_fd == 2) {
-                    printf("Zero progress");
-                    free(file_buffer);
-                    fclose(file);
-                    close(client_fd);
-                    continue;
-                }
+        // Open and serve the resolved file
+        FILE *file = fopen(absolute_file_path, "r");
+        if (file == NULL) {
+            error_handling(client_fd, absolute_file_path, "404 Not Found", "<html><body><h1>404 Not Found</h1></body></html>");
+            continue;
+        }
 
-                int send_file_fd = send_all(client_fd, file_buffer, bytes_read);
-                if (send_file_fd == 0) {
-                    perror("send");
-                    free(file_buffer);
-                    fclose(file);
-                    close(client_fd);
-                    continue;
-                } else if (send_file_fd == 2) {
-                    printf("Zero progress");
-                    free(file_buffer);
-                    fclose(file);
-                    close(client_fd);
-                    continue;
-                }
+        int fseek_result = fseek(file, 0, SEEK_END);
+        if (fseek_result != 0) {
+            error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+            fclose(file);
+            continue;
+        }
+        long file_size = ftell(file);
+        if (file_size < 0) {
+            error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+            fclose(file);
+            continue;
+        }
+        size_t file_size_t = (size_t)file_size;
+        rewind(file);
+        char *file_buffer = malloc(file_size_t + 1);
+        if (file_buffer == NULL) {
+            error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+            fclose(file);
+            continue;
+        }
+        size_t bytes_read = fread(file_buffer, 1, file_size_t, file);
+        file_buffer[bytes_read] = '\0';
+        if (bytes_read != file_size_t) {
+            if (ferror(file)) {
+                error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
             } else {
-                printf("Invalid response");
-                free(file_buffer);
-                fclose(file);
-                close(client_fd);
-                continue;
+                error_handling(client_fd, absolute_file_path, "404 Not Found", "<html><body><h1>404 Not Found</h1></body></html>");
             }
-
-            
-
-            
-
-            
-
-        
-
             free(file_buffer);
             fclose(file);
-            close(client_fd);
+            continue;
         }
+
+        // find last occurrence of '.' in the absolute file path
+        // to get the file extension
+
+        char *file_extension = strrchr(absolute_file_path, '.');
+        if (file_extension == NULL) {
+            file_extension = "";
+        } else {
+            file_extension++;
+        }
+        char *content_type = "text/plain";
+        if (strcmp(file_extension, "html") == 0) {
+            content_type = "text/html";
+            printf("Serving HTML file: %s\n", absolute_file_path);
+        } else if (strcmp(file_extension, "css") == 0) {
+            content_type = "text/css";
+            printf("Serving CSS file: %s\n", absolute_file_path);
+        } else if (strcmp(file_extension, "js") == 0) {
+            content_type = "application/javascript";
+            printf("Serving JS file: %s\n", absolute_file_path);
+        } else if (strcmp(file_extension, "png") == 0) {
+            content_type = "image/png";
+            printf("Serving PNG file: %s\n", absolute_file_path);
+        } else if (strcmp(file_extension, "jpg") == 0 || strcmp(file_extension, "jpeg") == 0) {
+            content_type = "image/jpeg";
+            printf("Serving JPG file: %s\n", absolute_file_path);
+        } else if (strcmp(file_extension, "gif") == 0) {
+            content_type = "image/gif";
+            printf("Serving GIF file: %s\n", absolute_file_path);
+        } else {
+            printf("Serving unknown file type: %s\n", absolute_file_path);
+            content_type = "application/octet-stream";
+        }
+
+        char response[1024];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            content_type,
+            bytes_read
+        );
+
+        if (response_len > 0 && response_len < (int)sizeof(response)) {
+            int send_fd = send_all(client_fd, response, (size_t)response_len);
+            if (send_fd == 0) {
+                error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+                free(file_buffer);
+                fclose(file);
+                continue;
+            } else if (send_fd == 2) {
+                error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+                free(file_buffer);
+                fclose(file);
+                continue;
+            }
+
+            int send_file_fd = send_all(client_fd, file_buffer, bytes_read);
+            if (send_file_fd == 0) {
+                error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+                free(file_buffer);
+                fclose(file);
+                continue;
+            } else if (send_file_fd == 2) {
+                error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+                free(file_buffer);
+                fclose(file);
+                continue;
+            }
+        } else {
+            printf("Invalid response");
+            error_handling(client_fd, absolute_file_path, "500 Internal Server Error", "<html><body><h1>500 Internal Server Error</h1></body></html>");
+            free(file_buffer);
+            fclose(file);
+            continue;
+        }
+
+        free(file_buffer);
+        fclose(file);
+        continue;
     }
+
+    return 0;
 }
 
+//method for sending bytes to the client, returns 1 if successful, 0 if error, 2 if zero progress
 
-    // const char *body = "<html><body><h1>Hello from C HTTP server</h1></body></html>";
-    // char response[1024];
-    // int response_len = snprintf(
-    //     response,
-    //     sizeof(response),
-    //     "HTTP/1.1 200 OK\r\n"
-    //     "Content-Type: text/html; charset=utf-8\r\n"
-    //     "Content-Length: %zu\r\n"
-    //     "Connection: close\r\n"
-    //     "\r\n"
-    //     "%s",
-    //     strlen(body),
-    //     body
-    // );
-
-    // if (response_len > 0 && response_len < (int)sizeof(response)) {
-
-    //     int send_fd = send(client_fd, response, (size_t)response_len, 0);
-    //     if (send_fd == -1) {
-    //         perror("send");
-    //         close(socket_fd);
-    //         close(client_fd);
-    //         return 1;
-    //     }
-    // }
-
-    // close(client_fd);
-    // close(socket_fd);
-    // return 0;
-
-
-int send_all (int client_fd, char* buffer, size_t bytes) {
+int send_all(int client_fd, char *buffer, size_t bytes) {
     size_t total_sent = 0;
 
-    while(total_sent < bytes) {
+    while (total_sent < bytes) {
         int send_fd = send(client_fd, buffer + total_sent, bytes - total_sent, 0);
         if (send_fd == -1) {
             return 0;
         }
-
         if (send_fd == 0) {
             return 2;
         }
-
         total_sent += send_fd;
     }
 
     return 1;
 }
+
+//handles all http errors, sends the appropriate response to the client and closes the connection
+
+void error_handling(int client_fd, char *absolute_file_path, char *error_type, char *body) {
+    char response[1024];
+    int response_len = snprintf(
+        response, sizeof(response),
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s",
+        error_type, strlen(body), body
+    );
+    if (response_len > 0 && response_len < (int)sizeof(response)) {
+        int send_fd = send_all(client_fd, response, (size_t)response_len);
+            if (send_fd == 0) {
+                perror("send");
+            }
+    }
+    if (absolute_file_path != NULL) {
+        free(absolute_file_path);
+    }
+    close(client_fd);
+
+}
+
+
